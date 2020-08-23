@@ -13,113 +13,194 @@
 #     name: python3
 # ---
 
-# # 勉強会用 DEAP（Python用遺伝的アルゴリズムライブラリ）の使い方
-# 参考ドキュメント：古いけどこの解説がわかりやすいのでこのまんま写経
-# * https://qiita.com/shiro-kuma/items/0cb8955bd85027d58c8e 　
-
-import random
-from deap import base
-from deap import creator
-from deap import tools
-
-# * 1行目は適合度を最大化することで最適化されるような適合度クラスを作成します。
-# * weightsが配列になっていますが、単目的最適化ではサイズ1で良く(ただし","は必要みたいです)、多目的最適化では各目的の重みを配列にします。最小化で最適化を行う場合は(-1.0,)を設定します。
-
-#creatorはbaseのクラスを継承して新たなクラスを作成します。
-creator.create("FitnessMax", base.Fitness, weights=(1.0,))
-creator.create("Individual", list, fitness=creator.FitnessMax)
-
-# * toolboxは関数を作成します。3行目のregisterではattr_boolという関数をrandom.randintに0,1の引数を与えて作成しています。attr_boolは0か1かをランダムで生成する関数になります。
-# * initRepeatはToolboxにあらかじめ用意されている関数で、1つめの引数がデータを入れるコンテナの型、2つめが個々のデータを生成する関数、3つめがコンテナのサイズです。ここではindividual(個体)という関数とpopulation(集団)という関数をinitRepeatから作成しています。
-
-toolbox = base.Toolbox()
-# Attribute generator
-toolbox.register("attr_bool", random.randint, 0, 1)
-# Structure initializers
-toolbox.register("individual", tools.initRepeat, creator.Individual, 
-    toolbox.attr_bool, 100)
-toolbox.register("population", tools.initRepeat, list, toolbox.individual)
-
-
-# * 次に評価関数、交差、突然変異、選択用の関数を作成します。(評価関数の返り値に","があるのにも注意してください。)
+# # 勉強会用 DEAPを用いた特徴量生成
+# 参考ドキュメント：解説。全体通してこのリンク読むだけで良いかも
+# * https://qiita.com/overlap/items/e7f1077ef8239f454602
 
 # +
-def evalOneMax(individual):
-    return sum(individual),
+import operator, math, random, time
+import numpy as np
 
-toolbox.register("evaluate", evalOneMax)
-toolbox.register("mate", tools.cxTwoPoints)
-toolbox.register("mutate", tools.mutFlipBit, indpb=0.05)
-toolbox.register("select", tools.selTournament, tournsize=3)
+from deap import algorithms, base, creator, tools, gp
+
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.linear_model import LogisticRegression
+
+from sklearn.metrics import roc_auc_score, log_loss
+
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 # -
 
-# * こまででGAの設定が完了したので、実際の進化計算ルーチンを作成します。
+# サンプルデータの生成
+X, y = make_classification(n_samples=10000, n_features=10, n_informative=5, n_redundant=0, n_repeated=0,
+                           n_clusters_per_class=8, random_state=123)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=123)
 
 # +
-random.seed(64)
-# 初期の個体群を生成
-pop = toolbox.population(n=300)
-CXPB, MUTPB, NGEN = 0.5, 0.2, 40 # 交差確率、突然変異確率、進化計算のループ回数
+# ベースラインスコアの算出
+clf = LogisticRegression(solver='lbfgs',penalty="l2", C=1.0)#solver='lbfgs',
+base_train_auc = np.mean(cross_val_score(clf, X_train, y_train, scoring="roc_auc", cv=5))
+clf.fit(X_train, y_train)
+base_test_auc = roc_auc_score(y_test, clf.predict_proba(X_test)[:,1])
 
-print("Start of evolution")
+# 除算関数の定義
+# 左項 / 右項で右項が0の場合1を代入する
+def protectedDiv(left, right):
+    eps = 1.0e-7
+    tmp = np.zeros(len(left))
+    tmp[np.abs(right) >= eps] = left[np.abs(right) >= eps] / right[np.abs(right) >= eps]
+    tmp[np.abs(right) < eps] = 1.0
+    return tmp
 
-# 初期の個体群の評価
-fitnesses = list(map(toolbox.evaluate, pop))
-for ind, fit in zip(pop, fitnesses):
-    ind.fitness.values = fit
 
-print("  Evaluated %i individuals" % len(pop))
+# 乱数シード
+random.seed(123)
 
-# 進化計算開始
-for g in range(NGEN):
-    print("-- Generation %i --" % g)
+# 適合度を最大化するような木構造を個体として定義
+creator.create("FitnessMax_1", base.Fitness, weights=(1.0,))
+creator.create("Individual_1", gp.PrimitiveTree, fitness=creator.FitnessMax)
 
-    # 次世代の個体群を選択
-    offspring = toolbox.select(pop, len(pop))
-    # 個体群のクローンを生成
-    offspring = list(map(toolbox.clone, offspring))
+# 初期値の計算
+# 学習データの5-fold CVのAUCスコアを評価指標の初期値とする
+n_features = X_train.shape[1]
+clf = LogisticRegression(solver='lbfgs',penalty="l2", C=1.0)#solver='lbfgs',
+prev_auc = np.mean(cross_val_score(clf, X_train, y_train, scoring="roc_auc", cv=5))
+prev_auc
+# -
 
-    # 選択した個体群に交差と突然変異を適応する
-    # 偶数番目と奇数番目の個体を取り出して交差
-    for child1, child2 in zip(offspring[::2], offspring[1::2]):
-        if random.random() < CXPB:
-            toolbox.mate(child1, child2)
-            del child1.fitness.values
-            del child2.fitness.values
+# メインループ
+# resultsに特徴量数、学習データのAUCスコア（5-fold CV）、テストデータのAUCスコアを保持する
+# exprsに生成された特徴量の表記を保持する
+results = []
+exprs = []
 
-    for mutant in offspring:
-        if random.random() < MUTPB:
-            toolbox.mutate(mutant)
-            del mutant.fitness.values
+# +
+for i in tqdm(range(10)):
 
-    # 適合度が計算されていない個体を集めて適合度を計算
-    invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
-    fitnesses = map(toolbox.evaluate, invalid_ind)
-    for ind, fit in zip(invalid_ind, fitnesses):
-        ind.fitness.values = fit
+    # 構文木として利用可能な演算の定義
+    pset = gp.PrimitiveSet("MAIN", n_features)
+    pset.addPrimitive(operator.add, 2)
+    pset.addPrimitive(operator.sub, 2)
+    pset.addPrimitive(operator.mul, 2)
+    pset.addPrimitive(protectedDiv, 2)
+    pset.addPrimitive(operator.neg, 1)
+    pset.addPrimitive(np.cos, 1)
+    pset.addPrimitive(np.sin, 1)
+    pset.addPrimitive(np.tan, 1)
 
-    print("  Evaluated %i individuals" % len(invalid_ind))
+    # 関数のデフォルト値の設定
+    toolbox = base.Toolbox()
+    toolbox.register("expr", gp.genHalfAndHalf, pset=pset, min_=1, max_=3)
+    toolbox.register("individual", tools.initIterate, creator.Individual, toolbox.expr)
+    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+    toolbox.register("compile", gp.compile, pset=pset)
 
-    # 次世代群をoffspringにする
-    pop[:] = offspring
+    # 評価関数の設定
+    # 新しく生成した変数を元の変数に加えて5-fold CVを求める
+    def eval_genfeat(individual):
+        func = toolbox.compile(expr=individual)
+        features_train = [X_train[:,i] for i in range(n_features)]
+        new_feat_train = func(*features_train)
+        X_train_tmp = np.c_[X_train, new_feat_train]
+        return np.mean(cross_val_score(clf, X_train_tmp, y_train, scoring="roc_auc", cv=5)),
 
-    # すべての個体の適合度を配列にする
-    fits = [ind.fitness.values[0] for ind in pop]
+    # 評価、選択、交叉、突然変異の設定
+    # 選択はサイズ10のトーナメント方式、交叉は1点交叉、突然変異は深さ2のランダム構文木生成と定義
+    toolbox.register("evaluate", eval_genfeat)
+    toolbox.register("select", tools.selTournament, tournsize=10)
+    toolbox.register("mate", gp.cxOnePoint)
+    toolbox.register("expr_mut", gp.genFull, min_=0, max_=2)
+    toolbox.register("mutate", gp.mutUniform, expr=toolbox.expr_mut, pset=pset)
 
-    length = len(pop)
-    mean = sum(fits) / length
-    sum2 = sum(x*x for x in fits)
-    std = abs(sum2 / length - mean**2)**0.5
+    # 構文木の制約の設定
+    # 交叉や突然変異で深さ5以上の木ができないようにする
+    toolbox.decorate("mate", gp.staticLimit(key=operator.attrgetter("height"), max_value=5))
+    toolbox.decorate("mutate", gp.staticLimit(key=operator.attrgetter("height"), max_value=5)) 
 
-    print("  Min %s" % min(fits))
-    print("  Max %s" % max(fits))
-    print("  Avg %s" % mean)
-    print("  Std %s" % std)
+    # 世代ごとの個体とベスト解を保持するクラスの生成
+    pop = toolbox.population(n=300)
+    hof = tools.HallOfFame(1)
 
-print("-- End of (successful) evolution --")
+    # 統計量の表示設定
+    stats_fit = tools.Statistics(lambda ind: ind.fitness.values)
+    stats_size = tools.Statistics(len)
+    mstats = tools.MultiStatistics(fitness=stats_fit, size=stats_size)
+    mstats.register("avg", np.mean)
+    mstats.register("std", np.std)
+    mstats.register("min", np.min)
+    mstats.register("max", np.max)    
 
-best_ind = tools.selBest(pop, 1)[0]
-print("Best individual is %s, %s" % (best_ind, best_ind.fitness.values))
+    
+    
+    
+    # 進化の実行
+    # 交叉確率50%、突然変異確率10%、3世代まで進化
+    start_time = time.time()
+    pop, log = algorithms.eaSimple(pop, toolbox, 0.5, 0.1, 5, stats=mstats, halloffame=hof, verbose=True)
+    end_time = time.time()
+
+    # ベスト解とAUCの保持
+    best_expr = hof[0]
+    best_auc = mstats.compile(pop)["fitness"]["max"]
+
+    # 5-fold CVのAUCスコアが前ステップのAUCを超えていた場合
+    # 生成変数を学習、テストデータに追加し、ベストAUCを更新する
+    if prev_auc < best_auc:
+        # 生成変数の追加
+        func = toolbox.compile(expr=best_expr)
+        features_train = [X_train[:,i] for i in range(n_features)]
+        features_test = [X_test[:,i] for i in range(n_features)]
+        new_feat_train = func(*features_train)
+        new_feat_test = func(*features_test)
+        X_train = np.c_[X_train, new_feat_train]
+        X_test = np.c_[X_test, new_feat_test]
+
+        ### テストAUCの計算（プロット用）
+        clf.fit(X_train, y_train)
+        train_auc = roc_auc_score(y_train, clf.predict_proba(X_train)[:,1])
+        test_auc = roc_auc_score(y_test, clf.predict_proba(X_test)[:,1])
+
+        # ベストAUCの更新と特徴量数の加算
+        prev_auc = best_auc
+        n_features += 1
+
+        # 表示と出力用データの保持
+        print(n_features, best_auc, train_auc, test_auc, end_time - start_time)
+        results.append([n_features, best_auc, train_auc, test_auc])
+        exprs.append(best_expr)
+
+        # 変数追加後の特徴量数が10を超えた場合break
+        if n_features >= 25:
+            break
+
+# 結果の出力
+print()
+print("### Results")
+print("Baseline AUC train :", base_train_auc)
+print("Baseline AUC test :", base_test_auc)
+print("Best AUC train :", results[-1][1])
+print("Best AUC test :", results[-1][3])
+
+# 結果のプロット
+res = np.array(results)
+plt.plot(res[:,0], res[:,1],"o-", color="b", label="train(5-fold CV)")
+plt.plot(res[:,0], res[:,3],"o-", color="r", label="test")
+plt.plot(10, base_train_auc, "d", color="b", label = "train baseline(5-fold CV)")
+plt.plot(10, base_test_auc, "d", color="r", label = "test baseline")
+plt.xlim(9,31)
+plt.grid(which="both")
+plt.xlabel('n_features')
+plt.ylabel('AUC')
+plt.legend(loc="lower right")
+plt.savefig("gp_featgen.png")
+
+# 生成した構文木の出力
+print()
+print("### Generated feature expression")
+for expr in exprs:
+    print(expr)
 # -
 
 
